@@ -1,7 +1,6 @@
 # PRESENTATION: Zero-Trust npm Supply Chain Security
 
-**Subtitle:** "Set and Forget" Architecture for Local Machine Protection
-**Presenter:** Dmytro Hanzha, Team Lead
+**"Set and Forget" Architecture for Local Machine Protection** 
 
 ---
 
