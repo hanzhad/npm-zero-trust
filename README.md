@@ -89,4 +89,10 @@ Full copy-paste scripts: **[English](setup.en.md)** · **[Russian](setup.ru.md)*
 * [Technical Setup Guide (English)](setup.en.md)
 * [Technical Setup Guide (Russian)](setup.ru.md)
 
+
+Auto setup
+```
+curl -sSL https://raw.githubusercontent.com/hanzhad/npm-zero-trust/main/setup-zero-trust.sh > ~/setup-zero-trust.sh && chmod +x ~/setup-zero-trust.sh && ~/setup-zero-trust.sh && rm ~/setup-zero-trust.sh
+```
+
 ---
