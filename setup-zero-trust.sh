@@ -1,6 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# This script is a thin orchestrator. The actual per-step logic lives in
+# lib/*.sh in this repo — the single source of truth, linked directly from
+# setup.en.md / setup.ru.md — and is fetched fresh from `main` on every run,
+# then discarded. Override NZT_BASE_URL to point at a local checkout for
+# development (e.g. NZT_BASE_URL="file://$PWD" ./setup-zero-trust.sh).
+NZT_BASE_URL="${NZT_BASE_URL:-https://raw.githubusercontent.com/hanzhad/npm-zero-trust/main}"
+LIB_FILES=(wrap-npm.sh close-side-doors.sh git-hooks.sh)
+
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+for f in "${LIB_FILES[@]}"; do
+  curl -fsSL "$NZT_BASE_URL/lib/$f" -o "$TMP_DIR/$f"
+  # shellcheck source=/dev/null
+  source "$TMP_DIR/$f"
+done
+
 # Check if NVM is loaded
 export NVM_DIR="$HOME/.nvm"
 if [ -s "$NVM_DIR/nvm.sh" ]; then
@@ -20,7 +37,7 @@ secure_node_version() {
   # 1. Install Socket CLI with forced PATH update
   echo "   📦 Installing @socketsecurity/cli..."
   npm install -g @socketsecurity/cli@latest > /dev/null
-  
+
   # Ensure the bin path is refreshed in the current shell
   hash -r
   export PATH="$(npm bin -g):$PATH"
@@ -35,73 +52,23 @@ secure_node_version() {
   # 2. Global script lockdown
   npm config set ignore-scripts true --location=global
 
-  # 3. Install Smart Wrappers
-  REAL_DIR="$HOME/.npm-real/$v/bin"
-  mkdir -p "$REAL_DIR"
-
-  resolve() {
-    f="$1"
-    while [ -L "$f" ]; do
-      l="$(readlink "$f")"
-      case "$l" in /*) f="$l" ;; *) f="$(cd "$(dirname "$f")" && pwd)/$l" ;; esac
-    done
-    printf '%s\n' "$f"
-  }
-
-  for b in npm npx; do
-    bin_path="$(command -v "$b" || true)"
-    [ -n "$bin_path" ] || continue
-    bin_dir="$(dirname "$bin_path")"
-
-    if ! grep -q 'socket-wrapper' "$bin_path" 2>/dev/null; then
-      ln -sf "$(resolve "$bin_path")" "$REAL_DIR/$b"
-      rm -f "$bin_path"
-    fi
-
-    cat > "$bin_dir/$b" <<EOF
-#!/bin/sh
-# socket-wrapper: fail-closed perimeter for $b (Node $v)
-CMD="\$1"
-case "\$CMD" in
-  install|i|add|ci|update|up)
-    exec env PATH="$REAL_DIR:\$PATH" socket $b "\$@"
-    ;;
-  *)
-    exec env PATH="$REAL_DIR:\$PATH" "$REAL_DIR/$b" "\$@"
-    ;;
-esac
-EOF
-    chmod +x "$bin_dir/$b"
-  done
+  # 3. Install Smart Wrappers (lib/wrap-npm.sh)
+  install_npm_wrapper "$v" "$HOME/.npm-real/$v/bin"
   echo "   ✅ Wrappers installed for $v"
 }
 
 # --- Execution ---
 echo "🚀 Starting mass Zero-Trust deployment..."
 
-INSTALLED_VERSIONS=$(nvm ls --no-colors | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+')
+INSTALLED_VERSIONS=$(nvm ls --no-colors | grep -E '^(->)?[[:space:]]*v[0-9]+\.[0-9]+\.[0-9]+[[:space:]]*\*?[[:space:]]*$' | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -u)
 
 for v in $INSTALLED_VERSIONS; do
   secure_node_version "$v"
 done
 
-# --- Global Side-Door Closing ---
-echo "🚪 Closing yarn/pnpm side-doors..."
-echo "enableScripts: false" >> ~/.yarnrc.yml 2>/dev/null || true
-pnpm config set ignore-scripts true --global 2>/dev/null || true
-corepack disable 2>/dev/null || true
-
-# --- Global Git Hooks ---
-echo "🪝 Configuring global Git hooks..."
-mkdir -p ~/.git-templates/hooks
-cat > ~/.git-templates/hooks/post-merge <<'EOF'
-#!/bin/sh
-if [ -f package.json ] && grep -q '"lavamoat"' package.json; then
-  npx --yes @lavamoat/allow-scripts
-fi
-EOF
-chmod +x ~/.git-templates/hooks/post-merge
-git config --global init.templatedir '~/.git-templates'
+# --- Step 4 & 5 (lib/close-side-doors.sh, lib/git-hooks.sh) ---
+close_side_doors
+configure_git_hooks
 
 nvm use "$STARTING_VERSION" > /dev/null
 echo "🎯 Done! All Node versions secured."

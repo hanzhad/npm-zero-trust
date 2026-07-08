@@ -42,60 +42,16 @@ npm config get ignore-scripts --location=global   # -> true
 
 ## Step 3 — Layer 2: replace the npm binary with the Socket wrapper (fail-closed perimeter)
 
-This relocates the **real** `npm`/`npx` into a private dir and puts a wrapper at the canonical path. Any caller — by name, by absolute path, from an IDE, or from an agent — hits the wrapper. The script is **idempotent** (safe to re-run).
+This relocates the **real** `npm`/`npx` into a private, per-Node-version dir and puts a wrapper at the canonical path. Any caller — by name, by absolute path, from an IDE, or from an agent — hits the wrapper. Non-mutating commands (`run`, `ls`, `--version`, …) go straight to the real binary; only `install`/`i`/`add`/`ci`/`update`/`up` route through `socket npm`. The logic is **idempotent** (safe to re-run).
+
+The wrapper file is an **sh/Node polyglot**: `@socketsecurity/cli` resolves "the real npm" by checking the file sitting next to the running `node` binary and re-invokes it via `node <that-path>`, bypassing shebangs entirely — so the wrapper has to parse as valid JavaScript too, or that self-invocation crashes with a `SyntaxError`. An env-var guard (`__SOCKET_WRAPPER_ACTIVE__`) stops Socket's own callback into this file from recursing forever.
+
+This is the only copy of this logic in the repo — **[`lib/wrap-npm.sh`](lib/wrap-npm.sh)**. `setup-zero-trust.sh` downloads and sources it automatically on every run; to apply it by hand for the currently active Node version:
 
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-REAL_DIR="$HOME/.npm-real/bin"
-mkdir -p "$REAL_DIR"
-
-# portable symlink resolver (macOS readlink lacks -f)
-resolve() {
-  f="$1"
-  while [ -L "$f" ]; do
-    l="$(readlink "$f")"
-    case "$l" in /*) f="$l" ;; *) f="$(cd "$(dirname "$f")" && pwd)/$l" ;; esac
-  done
-  printf '%s\n' "$f"
-}
-
-for b in npm npx; do
-  bin_path="$(command -v "$b" || true)"
-  [ -n "$bin_path" ] || { echo "skip: $b not found"; continue; }
-  bin_dir="$(dirname "$bin_path")"
-
-  # 1) stash the REAL binary (only if we haven't wrapped it already)
-  if ! grep -q 'socket-wrapper' "$bin_path" 2>/dev/null; then
-    ln -sf "$(resolve "$bin_path")" "$REAL_DIR/$b"   # absolute link to real launcher
-    rm -f "$bin_path"
-  fi
-
-  # 2) install the wrapper at the canonical path
-  cat > "$bin_dir/$b" <<EOF
-#!/bin/sh
-# socket-wrapper: fail-closed perimeter for $b
-# Put the real npm first so 'socket' finds it (and we don't recurse into ourselves).
-#
-# Smart routing: only route package-modifying commands through 'socket'.
-# Service/diagnostic commands (doctor, --version, ls, run, etc.) go straight
-# to the real binary — 'socket' doesn't handle non-interactive service calls
-# (e.g. from an IDE or AI agent) and hangs, leaking memory via an unbounded
-# stdout buffer.
-CMD="\$1"
-case "\$CMD" in
-  install|i|add|ci|update|up)
-    exec env PATH="\$HOME/.npm-real/bin:\$PATH" socket $b "\$@"
-    ;;
-  *)
-    exec env PATH="\$HOME/.npm-real/bin:\$PATH" "\$HOME/.npm-real/bin/$b" "\$@"
-    ;;
-esac
-EOF
-  chmod +x "$bin_dir/$b"
-  echo "wrapped: $bin_dir/$b  (real -> $REAL_DIR/$b)"
-done
+curl -fsSL https://raw.githubusercontent.com/hanzhad/npm-zero-trust/main/lib/wrap-npm.sh -o /tmp/wrap-npm.sh
+source /tmp/wrap-npm.sh
+install_npm_wrapper "$(node -v)" "$HOME/.npm-real/$(node -v)/bin"
 ```
 
 **Optional maximum hardening** — make the wrapper un-removable by the user/agent:
@@ -108,7 +64,7 @@ sudo chmod 755        "$(command -v npm)" "$(command -v npx)"
 Verify the wrapper is in place:
 
 ```bash
-head -3 "$(command -v npm)"        # -> #!/bin/sh  ... socket-wrapper ...
+head -5 "$(command -v npm)"        # -> #!/bin/sh  ... socket-wrapper ...
 npm install --dry-run left-pad     # should route through Socket
 ```
 
@@ -118,13 +74,12 @@ npm install --dry-run left-pad     # should route through Socket
 
 Fail-closed collapses if an agent just picks another package manager.
 
+Logic lives in **[`lib/close-side-doors.sh`](lib/close-side-doors.sh)**:
+
 ```bash
-# yarn (global):
-echo "enableScripts: false" >> ~/.yarnrc.yml
-# pnpm:
-pnpm config set ignore-scripts true --global 2>/dev/null || true
-# stop corepack from provisioning a "clean" yarn/pnpm:
-corepack disable 2>/dev/null || true
+curl -fsSL https://raw.githubusercontent.com/hanzhad/npm-zero-trust/main/lib/close-side-doors.sh -o /tmp/close-side-doors.sh
+source /tmp/close-side-doors.sh
+close_side_doors
 ```
 
 If `yarn` / `pnpm` / `bun` are installed, wrap them the same way as Step 3 (or remove them).
@@ -143,19 +98,12 @@ npx @lavamoat/allow-scripts setup   # writes ignore-scripts=true to the project 
 npx @lavamoat/allow-scripts auto    # builds the allow-list in package.json (review it!)
 ```
 
-**Global hook so it runs itself after every `git pull`:**
+**Global hook so it runs itself after every `git pull`** — logic lives in **[`lib/git-hooks.sh`](lib/git-hooks.sh)**:
 
 ```bash
-mkdir -p ~/.git-templates/hooks
-cat > ~/.git-templates/hooks/post-merge <<'EOF'
-#!/bin/sh
-# run allow-scripts only for projects that opted in
-if [ -f package.json ] && grep -q '"lavamoat"' package.json; then
-  npx --yes @lavamoat/allow-scripts
-fi
-EOF
-chmod +x ~/.git-templates/hooks/post-merge
-git config --global init.templatedir '~/.git-templates'
+curl -fsSL https://raw.githubusercontent.com/hanzhad/npm-zero-trust/main/lib/git-hooks.sh -o /tmp/git-hooks.sh
+source /tmp/git-hooks.sh
+configure_git_hooks
 ```
 
 > The template applies to repos you `git init` / `git clone` **after** this. For existing repos, copy the hook into `.git/hooks/post-merge`.
@@ -180,20 +128,23 @@ Because enforcement is at the binary + npm config, the IDE is already covered ev
 
 ## Honest limits & operations
 
-* **Residual bypass:** `node /path/to/npm-cli.js` skips the wrapper. Acceptable for the threat model (careless human + AI agent), not against a determined attacker already executing code locally.
+* **Residual bypass:** calling the real launcher directly by its stashed path (`~/.npm-real/<node-version>/bin/npm`) skips the wrapper — the canonical `npm`/`npx` paths and `node <that-path>` are both covered, since the wrapper is a polyglot Socket itself can't route around. Acceptable for the threat model (careless human + AI agent), not against a determined attacker already executing code locally.
 * **`brew upgrade node` restores the original npm** and removes the wrapper. Re-run Step 3 (it's idempotent), or add a brew post-upgrade hook.
-* **Fail-closed = unavailable on failure.** No network / expired `socket login` / rate-limit ⇒ installs are blocked by design. Break-glass for the admin: the real binary still lives at `~/.npm-real/bin/npm`.
+* **Fail-closed = unavailable on failure.** No network / expired `socket login` / rate-limit ⇒ installs are blocked by design. Break-glass for the admin: the real binary still lives at `~/.npm-real/<node-version>/bin/npm`.
 * **Always commit your lockfile and use `npm ci`** in CI — it installs exactly from the lockfile and fails on drift.
 
 ### Rollback
 
 ```bash
-for b in npm npx; do
-  bin_path="$(command -v "$b")"; bin_dir="$(dirname "$bin_path")"
-  if grep -q 'socket-wrapper' "$bin_path" 2>/dev/null; then
-    rm -f "$bin_path"
-    cp -P "$HOME/.npm-real/bin/$b" "$bin_dir/$b"   # restore real launcher
-  fi
+for v_dir in "$HOME"/.npm-real/*/; do
+  v="$(basename "$v_dir")"
+  for b in npm npx; do
+    bin_path="$HOME/.nvm/versions/node/$v/bin/$b"
+    if [ -f "$bin_path" ] && grep -q 'socket-wrapper' "$bin_path" 2>/dev/null; then
+      rm -f "$bin_path"
+      cp -P "$v_dir/$b" "$bin_path"   # restore real launcher
+    fi
+  done
 done
 npm config delete ignore-scripts --location=global
 git config --global --unset init.templatedir || true

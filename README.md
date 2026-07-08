@@ -71,7 +71,7 @@ Full copy-paste scripts: **[English](setup.en.md)** · **[Russian](setup.ru.md)*
 
 * **`node npm-cli.js` bypasses the wrapper.** Fine for the threat model (careless human + AI agent), not against a determined attacker already running code on your box.
 * **`brew upgrade node` restores the original npm** and removes the wrapper → the setup is idempotent; re-run it (or wire a brew post-upgrade hook).
-* **Fail-closed = unavailable on failure.** No network / expired `socket login` / rate-limit ⇒ installs are **blocked**. That's the deal ("blocked beats infected"). A non-obvious break-glass (`~/.npm-real/bin/npm`) stays for the admin.
+* **Fail-closed = unavailable on failure.** No network / expired `socket login` / rate-limit ⇒ installs are **blocked**. That's the deal ("blocked beats infected"). A non-obvious break-glass (`~/.npm-real/<node-version>/bin/npm`) stays for the admin.
 * **Side doors:** `yarn` / `pnpm` / `bun` / `corepack` must be closed too, or an agent just uses those (covered in the setup guide).
 
 ---

@@ -42,60 +42,16 @@ npm config get ignore-scripts --location=global   # -> true
 
 ## Шаг 3 — Слой 2: замена бинарника npm на wrapper Socket (fail-closed периметр)
 
-Прячем **настоящие** `npm`/`npx` в приватный каталог и ставим wrapper на канонический путь. Любой вызов — по имени, по абсолютному пути, из IDE или из агента — попадает в wrapper. Скрипт **идемпотентный** (можно запускать повторно).
+Прячем **настоящие** `npm`/`npx` в приватный, специфичный для версии Node каталог и ставим wrapper на канонический путь. Любой вызов — по имени, по абсолютному пути, из IDE или из агента — попадает в wrapper. Сервисные команды (`run`, `ls`, `--version`, …) идут напрямую в настоящий бинарник; через `socket npm` пускаются только `install`/`i`/`add`/`ci`/`update`/`up`. Логика **идемпотентная** (можно запускать повторно).
+
+Файл wrapper'а — это **sh/Node полиглот**: `@socketsecurity/cli` сам находит «настоящий npm», проверяя файл рядом с запущенным бинарником `node`, и перезапускает его через `node <путь>`, минуя shebang — поэтому wrapper обязан парситься ещё и как валидный JavaScript, иначе этот самовызов падает с `SyntaxError`. Guard через переменную окружения (`__SOCKET_WRAPPER_ACTIVE__`) останавливает бесконечную рекурсию, когда Socket сам вызывает этот же файл обратно.
+
+Это единственная копия этой логики в репозитории — **[`lib/wrap-npm.sh`](lib/wrap-npm.sh)**. `setup-zero-trust.sh` сам скачивает и подключает его при каждом запуске; чтобы применить вручную для текущей активной версии Node:
 
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-REAL_DIR="$HOME/.npm-real/bin"
-mkdir -p "$REAL_DIR"
-
-# переносимый резолвер симлинков (у macOS readlink нет -f)
-resolve() {
-  f="$1"
-  while [ -L "$f" ]; do
-    l="$(readlink "$f")"
-    case "$l" in /*) f="$l" ;; *) f="$(cd "$(dirname "$f")" && pwd)/$l" ;; esac
-  done
-  printf '%s\n' "$f"
-}
-
-for b in npm npx; do
-  bin_path="$(command -v "$b" || true)"
-  [ -n "$bin_path" ] || { echo "пропуск: $b не найден"; continue; }
-  bin_dir="$(dirname "$bin_path")"
-
-  # 1) прячем НАСТОЯЩИЙ бинарник (только если ещё не обёрнут)
-  if ! grep -q 'socket-wrapper' "$bin_path" 2>/dev/null; then
-    ln -sf "$(resolve "$bin_path")" "$REAL_DIR/$b"   # абсолютная ссылка на реальный launcher
-    rm -f "$bin_path"
-  fi
-
-  # 2) ставим wrapper на канонический путь
-  cat > "$bin_dir/$b" <<EOF
-#!/bin/sh
-# socket-wrapper: fail-closed периметр для $b
-# Настоящий npm первым в PATH, чтобы 'socket' нашёл его (и не было рекурсии в нас же).
-#
-# Smart routing: через 'socket' пускаем только команды, модифицирующие пакеты.
-# Сервисные/диагностические команды (doctor, --version, ls, run и т.п.) идут
-# напрямую в настоящий бинарник — 'socket' не умеет обрабатывать такие вызовы
-# в неинтерактивной среде (IDE, AI-агент), зависает и течёт по памяти из-за
-# нескончаемого буфера stdout.
-CMD="\$1"
-case "\$CMD" in
-  install|i|add|ci|update|up)
-    exec env PATH="\$HOME/.npm-real/bin:\$PATH" socket $b "\$@"
-    ;;
-  *)
-    exec env PATH="\$HOME/.npm-real/bin:\$PATH" "\$HOME/.npm-real/bin/$b" "\$@"
-    ;;
-esac
-EOF
-  chmod +x "$bin_dir/$b"
-  echo "обёрнут: $bin_dir/$b  (настоящий -> $REAL_DIR/$b)"
-done
+curl -fsSL https://raw.githubusercontent.com/hanzhad/npm-zero-trust/main/lib/wrap-npm.sh -o /tmp/wrap-npm.sh
+source /tmp/wrap-npm.sh
+install_npm_wrapper "$(node -v)" "$HOME/.npm-real/$(node -v)/bin"
 ```
 
 **Опционально, максимальная жёсткость** — сделать wrapper неудаляемым для юзера/агента:
@@ -108,7 +64,7 @@ sudo chmod 755        "$(command -v npm)" "$(command -v npx)"
 Проверка:
 
 ```bash
-head -3 "$(command -v npm)"        # -> #!/bin/sh  ... socket-wrapper ...
+head -5 "$(command -v npm)"        # -> #!/bin/sh  ... socket-wrapper ...
 npm install --dry-run left-pad     # должно пройти через Socket
 ```
 
@@ -118,13 +74,12 @@ npm install --dry-run left-pad     # должно пройти через Socket
 
 Fail-closed рушится, если агент просто возьмёт другой пакетный менеджер.
 
+Логика лежит в **[`lib/close-side-doors.sh`](lib/close-side-doors.sh)**:
+
 ```bash
-# yarn (глобально):
-echo "enableScripts: false" >> ~/.yarnrc.yml
-# pnpm:
-pnpm config set ignore-scripts true --global 2>/dev/null || true
-# запретить corepack поднимать «чистый» yarn/pnpm:
-corepack disable 2>/dev/null || true
+curl -fsSL https://raw.githubusercontent.com/hanzhad/npm-zero-trust/main/lib/close-side-doors.sh -o /tmp/close-side-doors.sh
+source /tmp/close-side-doors.sh
+close_side_doors
 ```
 
 Если установлены `yarn` / `pnpm` / `bun` — оберните их так же, как в Шаге 3 (или удалите).
@@ -143,19 +98,12 @@ npx @lavamoat/allow-scripts setup   # пропишет ignore-scripts=true в .n
 npx @lavamoat/allow-scripts auto    # соберёт allow-list в package.json (просмотрите его!)
 ```
 
-**Глобальный хук, чтобы всё запускалось само после `git pull`:**
+**Глобальный хук, чтобы всё запускалось само после `git pull`** — логика лежит в **[`lib/git-hooks.sh`](lib/git-hooks.sh)**:
 
 ```bash
-mkdir -p ~/.git-templates/hooks
-cat > ~/.git-templates/hooks/post-merge <<'EOF'
-#!/bin/sh
-# запускаем allow-scripts только для проектов, где он подключён
-if [ -f package.json ] && grep -q '"lavamoat"' package.json; then
-  npx --yes @lavamoat/allow-scripts
-fi
-EOF
-chmod +x ~/.git-templates/hooks/post-merge
-git config --global init.templatedir '~/.git-templates'
+curl -fsSL https://raw.githubusercontent.com/hanzhad/npm-zero-trust/main/lib/git-hooks.sh -o /tmp/git-hooks.sh
+source /tmp/git-hooks.sh
+configure_git_hooks
 ```
 
 > Шаблон применяется к репозиториям, которые вы `git init` / `git clone` **после** этого. Для существующих — скопируйте хук в `.git/hooks/post-merge`.
@@ -180,20 +128,23 @@ git config --global init.templatedir '~/.git-templates'
 
 ## Честно про пределы и эксплуатацию
 
-* **Остаточный обход:** `node /путь/к/npm-cli.js` минует wrapper. Для модели угрозы (забывчивый человек + AI-агент) это приемлемо, но не против целевого злоумышленника, уже исполняющего код локально.
+* **Остаточный обход:** вызов настоящего launcher'а напрямую по его спрятанному пути (`~/.npm-real/<версия-node>/bin/npm`) минует wrapper — а вот канонический путь `npm`/`npx` и `node <этот-путь>` перекрыты оба, потому что wrapper — полиглот, вокруг которого сам Socket объехать не может. Для модели угрозы (забывчивый человек + AI-агент) это приемлемо, но не против целевого злоумышленника, уже исполняющего код локально.
 * **`brew upgrade node` вернёт оригинальный npm** и снесёт wrapper. Перезапустите Шаг 3 (он идемпотентный) или повесьте brew post-upgrade хук.
-* **Fail-closed = недоступность при сбое.** Нет сети / истёк `socket login` / rate-limit ⇒ установки блокируются — это by design. Break-glass для админа: настоящий бинарник лежит в `~/.npm-real/bin/npm`.
+* **Fail-closed = недоступность при сбое.** Нет сети / истёк `socket login` / rate-limit ⇒ установки блокируются — это by design. Break-glass для админа: настоящий бинарник лежит в `~/.npm-real/<версия-node>/bin/npm`.
 * **Всегда коммитьте lockfile и используйте `npm ci`** в CI — он ставит строго из lockfile и падает при расхождении.
 
 ### Откат
 
 ```bash
-for b in npm npx; do
-  bin_path="$(command -v "$b")"; bin_dir="$(dirname "$bin_path")"
-  if grep -q 'socket-wrapper' "$bin_path" 2>/dev/null; then
-    rm -f "$bin_path"
-    cp -P "$HOME/.npm-real/bin/$b" "$bin_dir/$b"   # вернуть настоящий launcher
-  fi
+for v_dir in "$HOME"/.npm-real/*/; do
+  v="$(basename "$v_dir")"
+  for b in npm npx; do
+    bin_path="$HOME/.nvm/versions/node/$v/bin/$b"
+    if [ -f "$bin_path" ] && grep -q 'socket-wrapper' "$bin_path" 2>/dev/null; then
+      rm -f "$bin_path"
+      cp -P "$v_dir/$b" "$bin_path"   # вернуть настоящий launcher
+    fi
+  done
 done
 npm config delete ignore-scripts --location=global
 git config --global --unset init.templatedir || true
