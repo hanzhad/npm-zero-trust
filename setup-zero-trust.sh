@@ -1,84 +1,93 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "🚀 Initializing Zero-Trust architecture for npm..."
-
-# --- Step 1: Install Socket CLI ---
-echo "📦 Installing @socketsecurity/cli..."
-# If npm is already wrapped, use the direct path to ensure reliability
-if command -v npm | grep -q "npm-real"; then
-  npm install -g @socketsecurity/cli@latest
+# Check if NVM is loaded
+export NVM_DIR="$HOME/.nvm"
+if [ -s "$NVM_DIR/nvm.sh" ]; then
+  source "$NVM_DIR/nvm.sh"
 else
-  # If this is a clean Node installation
-  "$(command -v npm)" install -g @socketsecurity/cli@latest
+  echo "❌ NVM not found. Please install NVM first."
+  exit 1
 fi
 
-echo "🔑 Waiting for Socket CLI authorization..."
-echo "⚠️ IMPORTANT: When prompted for 'system-wide policies', select 'No'."
-echo "⚠️ IMPORTANT: When prompted for 'bash tab completion', select 'No'."
-socket login
+# Remember starting version to return to it later
+STARTING_VERSION=$(nvm current)
 
-# --- Step 2: Global script lockdown ---
-echo "🛑 Disabling global postinstall scripts..."
-npm config set ignore-scripts true --location=global
+# Function to secure a single Node version
+secure_node_version() {
+  local v=$1
+  echo "🛡️  Securing Node version $v..."
+  nvm use "$v" > /dev/null
 
-# --- Step 3: Install Smart Wrappers ---
-echo "🛡️ Configuring isolated routing for binaries..."
-REAL_DIR="$HOME/.npm-real/bin"
-mkdir -p "$REAL_DIR"
+  # 1. Install Socket CLI
+  echo "   📦 Installing @socketsecurity/cli..."
+  npm install -g @socketsecurity/cli@latest > /dev/null
 
-# Portable symlink resolver
-resolve() {
-  f="$1"
-  while [ -L "$f" ]; do
-    l="$(readlink "$f")"
-    case "$l" in /*) f="$l" ;; *) f="$(cd "$(dirname "$f")" && pwd)/$l" ;; esac
-  done
-  printf '%s\n' "$f"
-}
+  # 2. Global script lockdown
+  npm config set ignore-scripts true --location=global
 
-for b in npm npx; do
-  bin_path="$(command -v "$b" || true)"
-  [ -n "$bin_path" ] || { echo "Skip: $b not found"; continue; }
-  bin_dir="$(dirname "$bin_path")"
+  # 3. Install Smart Wrappers
+  REAL_DIR="$HOME/.npm-real/$v/bin"
+  mkdir -p "$REAL_DIR"
 
-  # Stash the REAL binary (only if we haven't wrapped it already)
-  if ! grep -q 'socket-wrapper' "$bin_path" 2>/dev/null; then
-    ln -sf "$(resolve "$bin_path")" "$REAL_DIR/$b"
-    rm -f "$bin_path"
-  fi
+  resolve() {
+    f="$1"
+    while [ -L "$f" ]; do
+      l="$(readlink "$f")"
+      case "$l" in /*) f="$l" ;; *) f="$(cd "$(dirname "$f")" && pwd)/$l" ;; esac
+    done
+    printf '%s\n' "$f"
+  }
 
-  # Install the wrapper at the canonical path
-  cat > "$bin_dir/$b" <<EOF
+  for b in npm npx; do
+    bin_path="$(command -v "$b" || true)"
+    [ -n "$bin_path" ] || continue
+    bin_dir="$(dirname "$bin_path")"
+
+    if ! grep -q 'socket-wrapper' "$bin_path" 2>/dev/null; then
+      ln -sf "$(resolve "$bin_path")" "$REAL_DIR/$b"
+      rm -f "$bin_path"
+    fi
+
+    cat > "$bin_dir/$b" <<EOF
 #!/bin/sh
-# socket-wrapper: fail-closed perimeter for $b
-# Smart routing: only route package-modifying commands through 'socket'.
+# socket-wrapper: fail-closed perimeter for $b (Node $v)
 CMD="\$1"
 case "\$CMD" in
   install|i|add|ci|update|up)
-    exec env PATH="\$HOME/.npm-real/bin:\$PATH" socket $b "\$@"
+    exec env PATH="$REAL_DIR:\$PATH" socket $b "\$@"
     ;;
   *)
-    exec env PATH="\$HOME/.npm-real/bin:\$PATH" "\$HOME/.npm-real/bin/$b" "\$@"
+    exec env PATH="$REAL_DIR:\$PATH" "$REAL_DIR/$b" "\$@"
     ;;
 esac
 EOF
-  chmod +x "$bin_dir/$b"
-  echo "✅ Wrapper installed: $bin_dir/$b"
+    chmod +x "$bin_dir/$b"
+  done
+  echo "   ✅ Wrappers installed for $v"
+}
+
+# --- Execution ---
+echo "🚀 Starting mass Zero-Trust deployment..."
+
+# Get all installed versions
+INSTALLED_VERSIONS=$(nvm ls --no-colors | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+')
+
+for v in $INSTALLED_VERSIONS; do
+  secure_node_version "$v"
 done
 
-# --- Step 4: Close the side doors ---
-echo "🚪 Blocking yarn, pnpm, and corepack side-doors..."
-echo "enableScripts: false" >> ~/.yarnrc.yml
+# --- Global Side-Door Closing ---
+echo "🚪 Closing yarn/pnpm side-doors..."
+echo "enableScripts: false" >> ~/.yarnrc.yml 2>/dev/null || true
 pnpm config set ignore-scripts true --global 2>/dev/null || true
 corepack disable 2>/dev/null || true
 
-# --- Step 5: Setup LavaMoat Git Hooks ---
-echo "🪝 Configuring global Git hooks for LavaMoat..."
+# --- Global Git Hooks ---
+echo "🪝 Configuring global Git hooks..."
 mkdir -p ~/.git-templates/hooks
 cat > ~/.git-templates/hooks/post-merge <<'EOF'
 #!/bin/sh
-# Run allow-scripts only for projects that opted in
 if [ -f package.json ] && grep -q '"lavamoat"' package.json; then
   npx --yes @lavamoat/allow-scripts
 fi
@@ -86,4 +95,7 @@ EOF
 chmod +x ~/.git-templates/hooks/post-merge
 git config --global init.templatedir '~/.git-templates'
 
-echo "🎯 Done! Zero-Trust architecture successfully applied to the current Node.js version."
+# Return to initial version
+nvm use "$STARTING_VERSION" > /dev/null
+
+echo "🎯 Done! All Node versions secured. Remember to 'nvm use' your project version to refresh paths."
