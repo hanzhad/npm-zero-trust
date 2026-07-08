@@ -10,18 +10,27 @@ else
   exit 1
 fi
 
-# Remember starting version to return to it later
 STARTING_VERSION=$(nvm current)
 
-# Function to secure a single Node version
 secure_node_version() {
   local v=$1
   echo "🛡️  Securing Node version $v..."
   nvm use "$v" > /dev/null
 
-  # 1. Install Socket CLI
+  # 1. Install Socket CLI with forced PATH update
   echo "   📦 Installing @socketsecurity/cli..."
   npm install -g @socketsecurity/cli@latest > /dev/null
+  
+  # Ensure the bin path is refreshed in the current shell
+  hash -r
+  export PATH="$(npm bin -g):$PATH"
+
+  # Verify socket is available
+  if ! command -v socket >/dev/null; then
+     echo "   ⚠️ Warning: Socket not immediately found in PATH. Retrying..."
+     sleep 2
+     export PATH="$HOME/.nvm/versions/node/$v/bin:$PATH"
+  fi
 
   # 2. Global script lockdown
   npm config set ignore-scripts true --location=global
@@ -70,7 +79,6 @@ EOF
 # --- Execution ---
 echo "🚀 Starting mass Zero-Trust deployment..."
 
-# Get all installed versions
 INSTALLED_VERSIONS=$(nvm ls --no-colors | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+')
 
 for v in $INSTALLED_VERSIONS; do
@@ -95,7 +103,5 @@ EOF
 chmod +x ~/.git-templates/hooks/post-merge
 git config --global init.templatedir '~/.git-templates'
 
-# Return to initial version
 nvm use "$STARTING_VERSION" > /dev/null
-
-echo "🎯 Done! All Node versions secured. Remember to 'nvm use' your project version to refresh paths."
+echo "🎯 Done! All Node versions secured."
