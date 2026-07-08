@@ -77,7 +77,21 @@ for b in npm npx; do
 #!/bin/sh
 # socket-wrapper: fail-closed периметр для $b
 # Настоящий npm первым в PATH, чтобы 'socket' нашёл его (и не было рекурсии в нас же).
-exec env PATH="\$HOME/.npm-real/bin:\$PATH" socket $b "\$@"
+#
+# Smart routing: через 'socket' пускаем только команды, модифицирующие пакеты.
+# Сервисные/диагностические команды (doctor, --version, ls, run и т.п.) идут
+# напрямую в настоящий бинарник — 'socket' не умеет обрабатывать такие вызовы
+# в неинтерактивной среде (IDE, AI-агент), зависает и течёт по памяти из-за
+# нескончаемого буфера stdout.
+CMD="\$1"
+case "\$CMD" in
+  install|i|add|ci|update|up)
+    exec env PATH="\$HOME/.npm-real/bin:\$PATH" socket $b "\$@"
+    ;;
+  *)
+    exec env PATH="\$HOME/.npm-real/bin:\$PATH" "\$HOME/.npm-real/bin/$b" "\$@"
+    ;;
+esac
 EOF
   chmod +x "$bin_dir/$b"
   echo "обёрнут: $bin_dir/$b  (настоящий -> $REAL_DIR/$b)"

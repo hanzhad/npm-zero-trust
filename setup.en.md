@@ -77,7 +77,21 @@ for b in npm npx; do
 #!/bin/sh
 # socket-wrapper: fail-closed perimeter for $b
 # Put the real npm first so 'socket' finds it (and we don't recurse into ourselves).
-exec env PATH="\$HOME/.npm-real/bin:\$PATH" socket $b "\$@"
+#
+# Smart routing: only route package-modifying commands through 'socket'.
+# Service/diagnostic commands (doctor, --version, ls, run, etc.) go straight
+# to the real binary — 'socket' doesn't handle non-interactive service calls
+# (e.g. from an IDE or AI agent) and hangs, leaking memory via an unbounded
+# stdout buffer.
+CMD="\$1"
+case "\$CMD" in
+  install|i|add|ci|update|up)
+    exec env PATH="\$HOME/.npm-real/bin:\$PATH" socket $b "\$@"
+    ;;
+  *)
+    exec env PATH="\$HOME/.npm-real/bin:\$PATH" "\$HOME/.npm-real/bin/$b" "\$@"
+    ;;
+esac
 EOF
   chmod +x "$bin_dir/$b"
   echo "wrapped: $bin_dir/$b  (real -> $REAL_DIR/$b)"
