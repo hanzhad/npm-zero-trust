@@ -1,124 +1,188 @@
-### Шаг 1: Подготовка инструментов
+# Zero-Trust npm — Техническая настройка (Fail-Closed)
 
-Установите основной сканер и авторизуйтесь:
+**Идеология:** безопасный путь должен быть *единственным*. Мы **не** полагаемся на shell-алиасы и настройки IDE — забывчивый юзер или AI-агент просто вызовет `npm` иначе. Enforcement стоит на двух слоях, которые нельзя объехать:
+
+1. **Собственный конфиг npm** (`ignore-scripts`) — читается при любом вызове.
+2. **Место бинарника `npm`** — файл по каноническому пути *и есть* wrapper.
+
+> Почему не `chmod -x $(which npm)`? Он не пропускает через таможню — он просто ломает npm, ломает свой же wrapper, слетает при каждом обновлении npm/node и обходится через `node npm-cli.js`. Не используем.
+
+Проверено на macOS (Node из Homebrew) + zsh. Для Linux поправьте пути.
+
+---
+
+## Шаг 1 — Установка сканера Socket
 
 ```bash
 npm install -g @socketsecurity/cli
 socket login
-
 ```
 
-### Шаг 2: Создание «Неприступного Прокси»
+`socket npm` / `socket npx` — drop-in обёртки, которые сканируют дерево зависимостей до скачивания пакетов.
 
-Создаем папку для защиты и файл-посредник, который будет единственной точкой входа для `npm`.
-
-1. **Создаем папку:**
-```bash
-mkdir -p ~/.socket-wrapper
-
-```
-
-
-2. **Создаем прокси-скрипт:**
-```bash
-nano ~/.socket-wrapper/npm
-
-```
-
-
-Вставьте этот код (замените `/usr/local/bin/socket` на вывод команды `which socket`):
-```bash
-#!/bin/bash
-# Полный путь к вашему socket бинарнику
-SOCKET_PATH=$(which socket)
-
-# Выполняем проверку и установку
-exec "$SOCKET_PATH" npm "$@"
-
-```
-
-
-3. **Делаем его исполняемым:**
-```bash
-chmod +x ~/.socket-wrapper/npm
-
-```
-
-
-
-### Шаг 3: Глобальная изоляция (Блокировка доступа)
-
-Теперь делаем «ход конем»: запрещаем системе использовать оригинальный `npm` напрямую.
-
-1. **Запрещаем авто-скрипты:**
-```bash
-npm config set ignore-scripts true
-
-```
-
-
-2. **Блокируем системный npm (физически):**
-```bash
-chmod -x $(which npm)
-
-```
-
-
-*(Если у вас есть `npx`, `yarn` или `pnpm`, сделайте `chmod -x` и для них тоже).*
-
-### Шаг 4: Настройка IDE (IntelliJ / WebStorm)
-
-IDE должна знать, что теперь npm — это ваш прокси-скрипт.
-
-1. Откройте **Settings -> Languages & Frameworks -> Node.js and npm**.
-2. В поле **Package manager** вставьте путь: `~/.socket-wrapper/npm`.
-3. Теперь IDE будет «стучаться» в ваш прокси, который сам вызовет Socket, а тот — всё остальное.
-
-### Шаг 5: Автоматизация (Git Hooks)
-
-Чтобы LavaMoat сам собирал нужные пакеты (Prisma, Next.js и т.д.) без вашего участия:
-
-1. **Создаем шаблон для всех будущих проектов:**
-```bash
-mkdir -p ~/.git-templates/hooks
-
-```
-
-
-2. **Создаем `post-merge`:**
-```bash
-nano ~/.git-templates/hooks/post-merge
-
-```
-
-
-Вставьте:
-```bash
-#!/bin/bash
-if [ -f "package.json" ] && grep -q '"lavamoat"' package.json; then
-  npx --yes allow-scripts
-fi
-
-```
-
-
-3. **Даем права и активируем:**
-```bash
-chmod +x ~/.git-templates/hooks/post-merge
-git config --global init.templatedir '~/.git-templates'
-
-```
-
-
+> **Границы Free-версии:** известная малварь **блокируется**; то, что ИИ пометил как *потенциальную* угрозу, только **предупреждает**. Поэтому снизу лежит Слой 1 как жёсткий стоп.
 
 ---
 
-### Как теперь выглядит жизнь "Настроил и забыл":
+## Шаг 2 — Слой 1: глобальный локдаун (необходимая таможня исполнения)
 
-* **Если вы просто пишете `npm install`:** Команда летит в ваш скрипт, потом в Socket, потом в npm. Всё безопасно.
-* **Если какой-то вирус или скрипт попытается запустить `npm` напрямую:** Он получит `Permission denied` (из-за `chmod -x`), так как не знает о вашем секретном прокси-скрипте.
-* **Если вы клонируете новый проект:** Вы заходите в него, делаете `npm install` (через прокси), а если нужна сборка — один раз делаете `npx allow-scripts setup`. Дальше всё работает само по Git-хукам.
+```bash
+npm config set ignore-scripts true --location=global
+```
 
-**Ваш статус:** Вы защищены на уровне ядра системы. Любая попытка установки пакетов проходит через таможню Socket.dev.
+npm читает этот конфиг **кто бы его ни запускал** — терминал, IDE, агент, subprocess, абсолютный путь. Вредоносные `postinstall`-скрипты (главный вектор supply-chain атак) не выполнятся. Скрипты нужны лишь ~2% пакетов; легитимные вернёт Слой 3.
 
-*Если вам нужно будет обновить Node.js/npm, просто верните права: `chmod +x $(which npm)`, обновитесь, и заблокируйте снова.*
+Проверка:
+
+```bash
+npm config get ignore-scripts --location=global   # -> true
+```
+
+---
+
+## Шаг 3 — Слой 2: замена бинарника npm на wrapper Socket (fail-closed периметр)
+
+Прячем **настоящие** `npm`/`npx` в приватный каталог и ставим wrapper на канонический путь. Любой вызов — по имени, по абсолютному пути, из IDE или из агента — попадает в wrapper. Скрипт **идемпотентный** (можно запускать повторно).
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+REAL_DIR="$HOME/.npm-real/bin"
+mkdir -p "$REAL_DIR"
+
+# переносимый резолвер симлинков (у macOS readlink нет -f)
+resolve() {
+  f="$1"
+  while [ -L "$f" ]; do
+    l="$(readlink "$f")"
+    case "$l" in /*) f="$l" ;; *) f="$(cd "$(dirname "$f")" && pwd)/$l" ;; esac
+  done
+  printf '%s\n' "$f"
+}
+
+for b in npm npx; do
+  bin_path="$(command -v "$b" || true)"
+  [ -n "$bin_path" ] || { echo "пропуск: $b не найден"; continue; }
+  bin_dir="$(dirname "$bin_path")"
+
+  # 1) прячем НАСТОЯЩИЙ бинарник (только если ещё не обёрнут)
+  if ! grep -q 'socket-wrapper' "$bin_path" 2>/dev/null; then
+    ln -sf "$(resolve "$bin_path")" "$REAL_DIR/$b"   # абсолютная ссылка на реальный launcher
+    rm -f "$bin_path"
+  fi
+
+  # 2) ставим wrapper на канонический путь
+  cat > "$bin_dir/$b" <<EOF
+#!/bin/sh
+# socket-wrapper: fail-closed периметр для $b
+# Настоящий npm первым в PATH, чтобы 'socket' нашёл его (и не было рекурсии в нас же).
+exec env PATH="\$HOME/.npm-real/bin:\$PATH" socket $b "\$@"
+EOF
+  chmod +x "$bin_dir/$b"
+  echo "обёрнут: $bin_dir/$b  (настоящий -> $REAL_DIR/$b)"
+done
+```
+
+**Опционально, максимальная жёсткость** — сделать wrapper неудаляемым для юзера/агента:
+
+```bash
+sudo chown root:wheel "$(command -v npm)" "$(command -v npx)"
+sudo chmod 755        "$(command -v npm)" "$(command -v npx)"
+```
+
+Проверка:
+
+```bash
+head -3 "$(command -v npm)"        # -> #!/bin/sh  ... socket-wrapper ...
+npm install --dry-run left-pad     # должно пройти через Socket
+```
+
+---
+
+## Шаг 4 — Закрываем боковые двери
+
+Fail-closed рушится, если агент просто возьмёт другой пакетный менеджер.
+
+```bash
+# yarn (глобально):
+echo "enableScripts: false" >> ~/.yarnrc.yml
+# pnpm:
+pnpm config set ignore-scripts true --global 2>/dev/null || true
+# запретить corepack поднимать «чистый» yarn/pnpm:
+corepack disable 2>/dev/null || true
+```
+
+Если установлены `yarn` / `pnpm` / `bun` — оберните их так же, как в Шаге 3 (или удалите).
+
+---
+
+## Шаг 5 — Слой 3: автосборка доверенного (LavaMoat + Git-хук)
+
+Со скриптами выключенными легитимной сборке (Prisma, Next.js, esbuild…) нужен allow-list.
+
+**Один раз на проект:**
+
+```bash
+npm i -D @lavamoat/allow-scripts
+npx @lavamoat/allow-scripts setup   # пропишет ignore-scripts=true в .npmrc проекта
+npx @lavamoat/allow-scripts auto    # соберёт allow-list в package.json (просмотрите его!)
+```
+
+**Глобальный хук, чтобы всё запускалось само после `git pull`:**
+
+```bash
+mkdir -p ~/.git-templates/hooks
+cat > ~/.git-templates/hooks/post-merge <<'EOF'
+#!/bin/sh
+# запускаем allow-scripts только для проектов, где он подключён
+if [ -f package.json ] && grep -q '"lavamoat"' package.json; then
+  npx --yes @lavamoat/allow-scripts
+fi
+EOF
+chmod +x ~/.git-templates/hooks/post-merge
+git config --global init.templatedir '~/.git-templates'
+```
+
+> Шаблон применяется к репозиториям, которые вы `git init` / `git clone` **после** этого. Для существующих — скопируйте хук в `.git/hooks/post-merge`.
+
+---
+
+## Шаг 6 — IDE (подстраховка, уже не критично)
+
+Так как enforcement стоит на бинарнике + конфиге npm, IDE защищена, даже если пропустить этот шаг. Настройка нужна лишь чтобы UI IDE не путался.
+
+* IntelliJ / WebStorm: **Settings → Languages & Frameworks → Node.js and npm → Package manager** → указать на обёрнутый `npm` (его обычный путь подходит — теперь это и есть wrapper).
+
+---
+
+## Как теперь выглядит «Настроил и забыл»
+
+* **`npm install`** → wrapper → скан Socket → настоящий npm, lifecycle-скрипты выключены. Чистые пакеты ставятся, вредоносные блокируются.
+* **Агент или забывчивый юзер вызывает `npm` (любым способом)** → всё равно попадает в wrapper; `postinstall` всё равно не выполнится (глобальный `ignore-scripts`). Мимо таможни не пройти.
+* **Клонируете проект со сборкой** → один раз `allow-scripts setup`, дальше всё делает Git-хук.
+
+---
+
+## Честно про пределы и эксплуатацию
+
+* **Остаточный обход:** `node /путь/к/npm-cli.js` минует wrapper. Для модели угрозы (забывчивый человек + AI-агент) это приемлемо, но не против целевого злоумышленника, уже исполняющего код локально.
+* **`brew upgrade node` вернёт оригинальный npm** и снесёт wrapper. Перезапустите Шаг 3 (он идемпотентный) или повесьте brew post-upgrade хук.
+* **Fail-closed = недоступность при сбое.** Нет сети / истёк `socket login` / rate-limit ⇒ установки блокируются — это by design. Break-glass для админа: настоящий бинарник лежит в `~/.npm-real/bin/npm`.
+* **Всегда коммитьте lockfile и используйте `npm ci`** в CI — он ставит строго из lockfile и падает при расхождении.
+
+### Откат
+
+```bash
+for b in npm npx; do
+  bin_path="$(command -v "$b")"; bin_dir="$(dirname "$bin_path")"
+  if grep -q 'socket-wrapper' "$bin_path" 2>/dev/null; then
+    rm -f "$bin_path"
+    cp -P "$HOME/.npm-real/bin/$b" "$bin_dir/$b"   # вернуть настоящий launcher
+  fi
+done
+npm config delete ignore-scripts --location=global
+git config --global --unset init.templatedir || true
+```
+
+---
